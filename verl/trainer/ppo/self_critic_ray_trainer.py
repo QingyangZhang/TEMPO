@@ -322,7 +322,7 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         self.use_rm = need_reward_model(self.role_worker_mapping)
-        self.use_critic = need_critic(self.config)
+        self.use_critic = need_critic(self.config) or config.actor_rollout_ref.self_critic
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -414,7 +414,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, confs, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -425,6 +425,7 @@ class RayPPOTrainer:
             "output": outputs,
             "gts": gts,
             "score": scores,
+            "conf": confs,
             "step": [self.global_steps] * n,
         }
 
@@ -526,6 +527,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        
+        if self.self_critic:
+            sample_vpreds = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -599,6 +603,11 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            
+            if self.self_critic:
+                values = self.critic_wg.compute_values(test_batch)
+                vpreds = vpreds.sum(-1).cpu().tolist()
+                sample_vpreds.extend(vpreds)
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
@@ -623,6 +632,7 @@ class RayPPOTrainer:
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
+                confs=sample_vpreds,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
@@ -1087,8 +1097,6 @@ class RayPPOTrainer:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
-                            
-                    assert "values" in batch.batch.keys(), "[ERROR] no values in line 1091"
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -1123,17 +1131,13 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        
-                    assert "values" in batch.batch.keys(), "[ERROR] no values in line 1127"
 
                     # update critic
-                    if self.use_critic:
+                    if self.use_critic or self.self_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
-                        
-                    assert "values" in batch.batch.keys(), "[ERROR] no values in line 1136"
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

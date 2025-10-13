@@ -12,6 +12,8 @@ strategy: ???
 # set it to True manually if you always want to enable critic worker
 enable: null
 
+self_critic: null
+
 # optimizer configs
 optim:
 

@@ -193,8 +193,12 @@ class DataParallelPPOCritic(BasePPOCritic):
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
-
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        
+        
+        if not self.config.self_critic:
+            select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        else:
+            select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns", "advantages"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -222,18 +226,27 @@ class DataParallelPPOCritic(BasePPOCritic):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    values = model_inputs["values"]
-                    returns = model_inputs["returns"]
 
                     vpreds = self._forward_micro_batch(model_inputs)
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        response_mask=response_mask,
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
-                    )
+                    if not self.config.self_critic:
+                        values = model_inputs["values"]
+                        returns = model_inputs["returns"]
+                        vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                            vpreds=vpreds,
+                            values=values,
+                            returns=returns,
+                            response_mask=response_mask,
+                            cliprange_value=self.config.cliprange_value,
+                            loss_agg_mode=self.config.loss_agg_mode,
+                        )
+                    else:
+                        advantages = model_inputs["advantages"]
+                        vf_loss, clf_acc = core_algos.compute_value_loss_self_critic(
+                            vpreds=vpreds,
+                            returns=advantages,
+                            response_mask=response_mask,
+                        )
+                        vf_clipfrac = torch.tensor(0.0, device=vf_loss.device)
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -251,6 +264,13 @@ class DataParallelPPOCritic(BasePPOCritic):
                             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
                         }
                     )
+                    
+                    if self.config.self_critic:
+                        micro_batch_metrics.update(
+                            {
+                                "critic/clf_acc": clf_acc.detach().item(),
+                            }
+                        )
 
                     append_to_dict(metrics, micro_batch_metrics)
 

@@ -1362,6 +1362,72 @@ def compute_value_loss(
     return vf_loss, vf_clipfrac
 
 
+import torch.nn.functional as F
+
+def compute_value_loss_self_critic(
+    vpreds: torch.Tensor,
+    returns: torch.Tensor,
+    response_mask: torch.Tensor,
+):
+    """
+    Compute the binary classification loss and sign agreement
+    using only the LAST valid token in each sequence.
+
+    Args:
+        vpreds (torch.FloatTensor):
+            Predicted logits from the value head, shape (batch_size, response_length).
+        returns (torch.FloatTensor):
+            Ground-truth returns (rewards), shape (batch_size, response_length).
+            Positive values are treated as label 1, non-positive as label 0.
+        response_mask (torch.Tensor):
+            Mask indicating which tokens are valid. The loss is computed only on the
+            last valid token for each sequence. Shape (batch_size, response_length).
+
+    Returns:
+        vf_loss (torch.FloatTensor):
+            A scalar tensor containing the binary cross-entropy loss, aggregated
+            by taking the mean over the batch.
+        sign_agreement_ratio (torch.FloatTensor):
+            The fraction of sequences in the batch where the sign of the predicted logit
+            matches the sign of the return at the last valid token (serves as an accuracy metric).
+    """
+    # Find the index of the last valid token for each sequence.
+    # This part remains unchanged.
+    last_token_indices = torch.sum(response_mask, dim=1).long() - 1
+    last_token_indices = last_token_indices.clamp(min=0)
+
+    # Gather the predictions (now interpreted as logits) and returns for the last token.
+    # This part also remains unchanged.
+    last_vpreds = torch.gather(vpreds, 1, last_token_indices.unsqueeze(1)).squeeze(1)
+    last_returns = torch.gather(returns, 1, last_token_indices.unsqueeze(1)).squeeze(1)
+
+    # --- START OF MODIFICATIONS ---
+
+    # 1. Convert continuous returns into binary labels.
+    # A positive return is mapped to 1.0, while a non-positive one is mapped to 0.0.
+    binary_labels = (last_returns > 0).float()
+
+    # 2. Calculate the Binary Cross-Entropy loss using the logits.
+    # This single function combines a Sigmoid layer and the BCE loss in a
+    # numerically stable way.
+    vf_loss = F.binary_cross_entropy_with_logits(last_vpreds, binary_labels)
+
+    predicted_labels = (last_vpreds > 0.00001).float()
+    
+    # 2. 获取真实的类别标签 (这和计算 loss 时用的 binary_labels 完全一样)
+    ground_truth_labels = (last_returns > 0.0001).float()
+    
+    # 3. 计算预测标签和真实标签一致的比例，即准确率
+    accuracy = (predicted_labels == ground_truth_labels).float().mean()
+    
+    # 返回这个新的、更准确的评估指标
+    # 你可以重命名 sign_agreement_ratio 为 vf_accuracy
+    vf_accuracy = accuracy 
+    
+    # return vf_loss, sign_agreement_ratio  <- 旧的返回
+    return vf_loss, vf_accuracy  # <- 新的返回
+
+
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.
