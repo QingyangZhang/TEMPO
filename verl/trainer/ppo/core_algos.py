@@ -1406,7 +1406,7 @@ def compute_value_loss_self_critic(
     # 1. Convert continuous returns into binary labels.
     # A positive return is mapped to 1.0, while a non-positive one is mapped to 0.0.
     binary_labels = (last_returns > 0).float()
-
+    
     # 2. Calculate the Binary Cross-Entropy loss using the logits.
     # This single function combines a Sigmoid layer and the BCE loss in a
     # numerically stable way.

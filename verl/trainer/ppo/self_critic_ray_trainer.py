@@ -528,7 +528,7 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         
-        if self.self_critic:
+        if self.config.critic.self_critic:
             sample_vpreds = []
 
         for test_data in self.val_dataloader:
@@ -604,10 +604,37 @@ class RayPPOTrainer:
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
             
-            if self.self_critic:
-                values = self.critic_wg.compute_values(test_batch)
-                vpreds = vpreds.sum(-1).cpu().tolist()
-                sample_vpreds.extend(vpreds)
+            '''
+            if self.config.critic.self_critic:
+                vpreds = self.critic_wg.compute_values(test_batch).batch['values']
+                response_mask = compute_response_mask(test_batch)
+                last_token_indices = torch.sum(response_mask, dim=1).long() - 1
+                last_vpreds = torch.gather(vpreds, 1, last_token_indices.unsqueeze(1)).squeeze(1)
+                #confidences = last_vpreds.cpu().tolist()
+                #values = vpreds * response_mask
+                #mean_values = values.sum(dim=1) / response_mask.sum(dim=1)
+                #confidences = mean_values.cpu().tolist()
+                sample_vpreds.extend(confidences)
+                reward_extra_infos_dict["confidence"].extend(confidences)
+            '''
+                
+            if self.config.critic.self_critic:
+                vpreds = self.critic_wg.compute_values(test_batch).batch['values']
+                response_mask = compute_response_mask(test_batch)
+                response_lengths = torch.sum(response_mask, dim=1, keepdim=True)
+                tail_percentage = 0.2
+                num_tokens_in_tail = torch.ceil(response_lengths * tail_percentage).long()
+                start_indices = (response_lengths - num_tokens_in_tail).clamp(min=0)
+                seq_len = response_mask.shape[1]
+                col_indices = torch.arange(seq_len, device=response_mask.device).unsqueeze(0)
+                tail_mask = (col_indices >= start_indices) & (response_mask == 1)
+                values_in_tail = vpreds * tail_mask
+                sum_values = values_in_tail.sum(dim=1)
+                num_tokens_to_average = tail_mask.sum(dim=1).clamp(min=1)
+                mean_values = sum_values / num_tokens_to_average
+                confidences = mean_values.cpu().tolist()
+                sample_vpreds.extend(confidences)
+                reward_extra_infos_dict["confidence"].extend(confidences)
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")

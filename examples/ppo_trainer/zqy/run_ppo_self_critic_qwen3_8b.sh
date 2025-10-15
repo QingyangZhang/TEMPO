@@ -25,7 +25,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE="${HAS_NVLINK:-0}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 
-export WANDB_MODE=offline
+export WANDB_MODE=disabled
 export WANDB_API_KEY=="3033da39c2bf837949ca77dbd720af778de6515d"
 export WANDB_DIR="/mnt/shared-storage-user/p1-shared/zhangqingyang/wandb/ppo-self-critic"
 
@@ -173,9 +173,12 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo_self_critic \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
+    trainer.val_only=True \
+    trainer.validation_data_dir=/mnt/shared-storage-user/p1-shared/zhangqingyang/rollout/self-critic-ppo \
     trainer.test_freq=16 \
-    trainer.save_freq=128 \
-    trainer.total_training_steps=4000 \
+    trainer.save_freq=32 \
+    trainer.total_training_steps=32 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.resume_mode=auto 2>&1 | tee "${LOG_FILE}"
+    trainer.resume_from_path=/mnt/shared-storage-user/zhangqingyang/ckpts/kxk/PPO-verl/Qwen3-8B-1013:111548/global_step_224
+    trainer.resume_mode=resume_path 2>&1 | tee "${LOG_FILE}"
