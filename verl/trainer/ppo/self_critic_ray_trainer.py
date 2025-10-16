@@ -610,7 +610,7 @@ class RayPPOTrainer:
                 response_mask = compute_response_mask(test_batch)
                 last_token_indices = torch.sum(response_mask, dim=1).long() - 1
                 last_vpreds = torch.gather(vpreds, 1, last_token_indices.unsqueeze(1)).squeeze(1)
-                #confidences = last_vpreds.cpu().tolist()
+                confidences = last_vpreds.cpu().tolist()
                 #values = vpreds * response_mask
                 #mean_values = values.sum(dim=1) / response_mask.sum(dim=1)
                 #confidences = mean_values.cpu().tolist()
@@ -619,11 +619,37 @@ class RayPPOTrainer:
             '''
                 
             if self.config.critic.self_critic:
+                N = 128
+                vpreds = self.critic_wg.compute_values(test_batch).batch['values']
+                response_mask = compute_response_mask(test_batch)
+                response_lengths = torch.sum(response_mask, dim=1)
+                # To avoid errors with responses shorter than N, take the minimum
+                # This ensures we only average as many tokens as are available in the response
+                num_tokens_to_avg = torch.minimum(response_lengths, torch.tensor(N, device=response_lengths.device))
+                # Create a cumulative sum of the response mask to identify token positions within the response
+                # e.g., for a mask [0, 1, 1, 1, 0], the cumsum is [0, 1, 2, 3, 3]
+                cumsum_mask = torch.cumsum(response_mask, dim=1)
+                # Create a mask that is True only for the last N tokens of each response
+                # The condition checks which tokens have a position greater than (total_length - N)
+                last_n_mask = (cumsum_mask > (response_lengths - num_tokens_to_avg).unsqueeze(1)) & response_mask.bool()
+                # Apply the mask to the value predictions, setting non-relevant values to 0
+                masked_vpreds = vpreds * last_n_mask
+                # Sum the values of the last N tokens and divide by the actual number of tokens considered (N or less)
+                # Add a small epsilon to prevent division by zero for empty responses
+                sum_last_n_vpreds = torch.sum(masked_vpreds, dim=1)
+                mean_values = sum_last_n_vpreds / (num_tokens_to_avg + 1e-9)
+                confidences = mean_values.cpu().tolist()
+                sample_vpreds.extend(confidences)
+                reward_extra_infos_dict["confidence"].extend(confidences)
+            
+            '''
+            if self.config.critic.self_critic:
                 vpreds = self.critic_wg.compute_values(test_batch).batch['values']
                 response_mask = compute_response_mask(test_batch)
                 response_lengths = torch.sum(response_mask, dim=1, keepdim=True)
-                tail_percentage = 0.2
+                tail_percentage = 0.001
                 num_tokens_in_tail = torch.ceil(response_lengths * tail_percentage).long()
+                num_tokens_in_tail = num_tokens_in_tail.clamp(min=1)
                 start_indices = (response_lengths - num_tokens_in_tail).clamp(min=0)
                 seq_len = response_mask.shape[1]
                 col_indices = torch.arange(seq_len, device=response_mask.device).unsqueeze(0)
@@ -635,7 +661,7 @@ class RayPPOTrainer:
                 confidences = mean_values.cpu().tolist()
                 sample_vpreds.extend(confidences)
                 reward_extra_infos_dict["confidence"].extend(confidences)
-
+            '''
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
             if "reward_extra_info" in result:
