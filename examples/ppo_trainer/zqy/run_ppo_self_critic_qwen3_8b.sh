@@ -76,8 +76,9 @@ LOG_FILE="${LOG_DIR}/Qwen3-8B-${DATE}_${TIME_TAG}.log"
 # MODEL_PATH=${MODEL_PATH:-"/mnt/shared-storage-user/p1-shared/Qwen/Qwen3-8B-Base"}
 MODEL_PATH=${MODEL_PATH:-"/mnt/shared-storage-user/zhangqingyang/ckpts/kxk/DAPO-verl/Qwen3-8B-gspo-0923:153550/hf/global_step_256"}
 CKPTS_DIR=${CKPTS_DIR:-"/mnt/shared-storage-user/zhangqingyang/ckpts/ppo-self-critic/${project_name}/${exp_name}"}
-train_files=${train_files:-"/mnt/shared-storage-user/p1-shared/zhangqingyang/kxk2/data/dapo-math-17k.parquet"}
-test_files=${test_files:-"/mnt/shared-storage-user/p1-shared/zhangqingyang/kxk2/data/dapo-aime-2024.parquet"}
+train_files=${train_files:-"/mnt/shared-storage-user/p1-shared/zhangqingyang/kxk2/data/dapo/dapo-math-17k.parquet"}
+test_files=${test_files:-"/mnt/shared-storage-user/p1-shared/zhangqingyang/kxk2/data/dapo/dapo-aime-2024.parquet"}
+# test_files=${test_files:-"/mnt/shared-storage-user/p1-shared/zhangqingyang/kxk2/data/dapo/dapo-amc23.parquet"}
 
 # Algorithm
 temperature=1.0

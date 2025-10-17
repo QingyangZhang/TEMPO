@@ -623,6 +623,15 @@ class RayPPOTrainer:
                 vpreds = self.critic_wg.compute_values(test_batch).batch['values']
                 response_mask = compute_response_mask(test_batch)
                 response_lengths = torch.sum(response_mask, dim=1)
+                # vpreds = vpreds.clamp(min=-3,max=3)
+                response_only_vpreds = vpreds[response_mask.bool()]
+                mean_vpreds = torch.mean(response_only_vpreds)
+                std_vpreds = torch.std(response_only_vpreds)
+                # Define the upper and lower bounds based on the 3-sigma rule
+                lower_bound = mean_vpreds - 3 * std_vpreds
+                upper_bound = mean_vpreds + 3 * std_vpreds
+                # Clamp the values outside the 3-sigma range
+                vpreds = torch.clamp(vpreds, min=lower_bound, max=upper_bound)
                 # To avoid errors with responses shorter than N, take the minimum
                 # This ensures we only average as many tokens as are available in the response
                 num_tokens_to_avg = torch.minimum(response_lengths, torch.tensor(N, device=response_lengths.device))
