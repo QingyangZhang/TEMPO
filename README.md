@@ -2,8 +2,7 @@
 
 <div align="center">
 
-**TEMPO** is a semi-supervised reinforcement learning framework for scaling test-time training (TTT) of large reasoning models.  
-It alternates between a **Critic Recalibration** step (E-step) on labeled data and a **Policy Refinement** step (M-step) on unlabeled data, enabling effective use of both labeled and unlabeled problem sets.
+**TEMPO** is a semi-supervised reinforcement learning framework for scaling test-time training (TTT) of large reasoning models. It alternates between a **Critic Recalibration** step (E-step) on labeled data and a **Policy Refinement** step (M-step) on unlabeled data, enabling effective use of both labeled and unlabeled problem sets.
 
 </div>
 
@@ -11,7 +10,7 @@ It alternates between a **Critic Recalibration** step (E-step) on labeled data a
 
 ## News
 
-- **[2026-04]** TEMPO preprint released. Code and models coming soon.
+- **[2026-04]** TEMPO code released.
 
 ---
 
