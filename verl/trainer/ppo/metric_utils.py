@@ -17,13 +17,31 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable
+from math import comb
+from typing import Any, Callable, Dict, List
 
 import numpy as np
 import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+def compute_pass_at_k(n: int, c: int, k: int) -> float:
+    """
+    Compute the unbiased pass@K estimator using the standard combinatorial formula.
+
+    Args:
+        n: Total number of samples per problem.
+        c: Number of correct samples.
+        k: Top-k threshold.
+
+    Returns:
+        Unbiased estimate of pass@K. Returns 1.0 if n - c < k.
+    """
+    if n - c < k:
+        return 1.0
+    return 1.0 - comb(n - c, k) / comb(n, k)
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -76,7 +94,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
-
+'''
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -223,6 +241,131 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     return metrics
 
+'''
+
+def compute_data_metrics(batch: Any, use_critic: bool = True) -> dict[str, Any]:
+    """
+    Computes various metrics from a batch of data for PPO training, 
+    split by labeled (train) and unlabeled (test) samples if applicable.
+    """
+    sequence_score = batch.batch["token_level_scores"].sum(-1)
+    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    advantages = batch.batch["advantages"]
+    returns = batch.batch["returns"]
+    response_mask = batch.batch["response_mask"].bool()
+    
+    max_response_length = batch.batch["responses"].shape[-1]
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info["prompt_length"]
+    response_length = response_info["response_length"]
+    
+    prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
+    max_prompt_length = prompt_mask.size(-1)
+
+    aborted_mask = (response_length == 0).bool()
+    non_aborted_mask = ~aborted_mask
+
+    is_labeled_exists = "is_labeled" in batch.batch
+    if is_labeled_exists:
+        is_labeled = batch.batch["is_labeled"].view(-1).bool()
+        is_unlabeled = ~is_labeled
+    else:
+        is_labeled = None
+        is_unlabeled = None
+
+    metrics = {}
+
+    def add_split_metrics(mask: torch.Tensor, suffix: str):
+        valid_non_aborted = mask & non_aborted_mask
+        if valid_non_aborted.any():
+            s = sequence_score[valid_non_aborted]
+            r = sequence_reward[valid_non_aborted]
+            metrics[f"critic/score/mean{suffix}"] = s.mean().item()
+            metrics[f"critic/score/max{suffix}"] = s.max().item()
+            metrics[f"critic/score/min{suffix}"] = s.min().item()
+            metrics[f"critic/rewards/mean{suffix}"] = r.mean().item()
+            metrics[f"critic/rewards/max{suffix}"] = r.max().item()
+            metrics[f"critic/rewards/min{suffix}"] = r.min().item()
+
+        token_mask = mask.unsqueeze(-1) & response_mask
+        if token_mask.any():
+            adv = torch.masked_select(advantages, token_mask)
+            ret = torch.masked_select(returns, token_mask)
+            metrics[f"critic/advantages/mean{suffix}"] = adv.mean().item()
+            metrics[f"critic/advantages/max{suffix}"] = adv.max().item()
+            metrics[f"critic/advantages/min{suffix}"] = adv.min().item()
+            metrics[f"critic/returns/mean{suffix}"] = ret.mean().item()
+            metrics[f"critic/returns/max{suffix}"] = ret.max().item()
+            metrics[f"critic/returns/min{suffix}"] = ret.min().item()
+
+            if use_critic:
+                vals = torch.masked_select(batch.batch["values"], token_mask)
+                metrics[f"critic/values/mean{suffix}"] = vals.mean().item()
+                metrics[f"critic/values/max{suffix}"] = vals.max().item()
+                metrics[f"critic/values/min{suffix}"] = vals.min().item()
+                
+                # VF Explained Variance
+                return_diff_var = torch.var(ret - vals)
+                return_var = torch.var(ret)
+                explained_var = (1.0 - return_diff_var / (return_var + 1e-5)).item()
+                metrics[f"critic/vf_explained_var{suffix}"] = explained_var
+
+    if is_labeled_exists:
+        add_split_metrics(is_labeled, "_train")
+        add_split_metrics(is_unlabeled, "_test")
+    else:
+        add_split_metrics(torch.ones_like(non_aborted_mask), "")
+
+    
+    # Aborted ratio
+    metrics["response/aborted_ratio"] = torch.mean(aborted_mask.float()).item()
+    
+    if is_labeled_exists:
+        metrics["response/is_labeled"] = torch.mean(is_labeled.float()).item()
+
+    # Response Length (Total)
+    metrics["response_length/mean"] = response_length.float().mean().item()
+    metrics["response_length/max"] = response_length.max().item()
+    metrics["response_length/min"] = response_length.min().item()
+    metrics["response_length/clip_ratio"] = torch.mean(
+        torch.eq(response_length, max_response_length).float()
+    ).item()
+
+    # Response Length (Non-aborted)
+    non_aborted_response_length = response_length[non_aborted_mask]
+    if non_aborted_response_length.numel() > 0:
+        metrics["response_length_non_aborted/mean"] = non_aborted_response_length.float().mean().item()
+        metrics["response_length_non_aborted/max"] = non_aborted_response_length.max().item()
+        metrics["response_length_non_aborted/min"] = non_aborted_response_length.min().item()
+        metrics["response_length_non_aborted/clip_ratio"] = torch.mean(
+            torch.eq(non_aborted_response_length, max_response_length).float()
+        ).item()
+    else:
+        metrics["response_length_non_aborted/mean"] = 0.0
+
+    # Prompt Length
+    metrics["prompt_length/mean"] = prompt_length.float().mean().item()
+    metrics["prompt_length/max"] = prompt_length.max().item()
+    metrics["prompt_length/min"] = prompt_length.min().item()
+    metrics["prompt_length/clip_ratio"] = torch.mean(
+        torch.eq(prompt_length, max_prompt_length).float()
+    ).item()
+
+    # Multi-turn & Tool calls
+    if "__num_turns__" in batch.non_tensor_batch:
+        num_turns = batch.non_tensor_batch["__num_turns__"]
+        metrics["num_turns/min"] = num_turns.min().item() if hasattr(num_turns, 'min') else min(num_turns)
+        metrics["num_turns/max"] = num_turns.max().item() if hasattr(num_turns, 'max') else max(num_turns)
+        metrics["num_turns/mean"] = num_turns.mean().item() if hasattr(num_turns, 'mean') else (sum(num_turns)/len(num_turns))
+
+    if "tool_call_counts" in batch.non_tensor_batch:
+        tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
+        metrics["tool_call_counts/min"] = tool_call_counts.min().item()
+        metrics["tool_call_counts/max"] = tool_call_counts.max().item()
+        metrics["tool_call_counts/mean"] = tool_call_counts.mean().item()
+
+    return metrics
+
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
@@ -265,6 +408,19 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         },
     }
 
+def compute_overlong_metrics(batch: DataProto) -> Dict[str, Any]:
+    overlong_dict = {}
+    overlong_dict["overlong_reward"] = batch.non_tensor_batch["overlong_reward"]
+    overlong_dict["overlong"] = batch.non_tensor_batch["overlong"]
+    
+    return reduce_metrics(overlong_dict)
+
+def compute_empo_metrics(batch: DataProto) -> Dict[str, Any]:
+    empo_dict = {}
+    empo_dict['majority_ratio'] = batch.non_tensor_batch['majority_ratio']
+    empo_dict['label_accuracy'] = batch.non_tensor_batch['label_accuracy']
+    
+    return reduce_metrics(empo_dict)
 
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
     """
@@ -415,6 +571,7 @@ def process_validation_metrics(
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
+        - "pass@K": Unbiased combinatorial estimator of pass@K (for binary metrics like score/acc)
 
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
@@ -436,6 +593,13 @@ def process_validation_metrics(
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         for uid, var2vals in uid2var2vals.items():
             for var_name, var_vals in var2vals.items():
+                if len(var_vals) == 0:
+                    continue
+                # Filter out non-numeric values (None, str, etc.)
+                var_vals = [v for v in var_vals if isinstance(v, (int, float, np.integer, np.floating))]
+                
+                if len(var_vals) == 0:
+                    continue
                 if isinstance(var_vals[0], str):
                     continue
 
@@ -459,6 +623,7 @@ def process_validation_metrics(
                         )
                         metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
                         metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+
                         if var2vals.get("pred", None) is not None:
                             vote_data = [
                                 {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
@@ -470,6 +635,14 @@ def process_validation_metrics(
                                 seed=seed,
                             )
                             metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+
+                    # Compute unbiased pass@K using the standard combinatorial estimator
+                    # var_vals are binary scores (0/1) per sample for this prompt
+                    c = int(sum(var_vals))  # number of correct samples
+                    n_total = n_resps  # total samples
+                    for k in ns:
+                        metric[f"pass@{k}"] = compute_pass_at_k(n_total, c, k)
+                        
 
                 data_src2uid2var2metric[data_source][uid][var_name] = metric
 

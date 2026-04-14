@@ -261,11 +261,23 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 unwrap_model = self.model._fsdp_wrapped_module
             else:
                 unwrap_model = self.model
+            
+            ### fix bug for OLMO3
+            if hasattr(unwrap_model, 'pretrained_model'):
+                unwrap_model = unwrap_model.pretrained_model
+                log_with_rank(
+                    f"Unwrap TRL model",
+                    rank=self.rank,
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
+                
 
             hf_config_tokenizer_path = os.path.join(local_path, "huggingface")
             local_mkdir_safe(hf_config_tokenizer_path)
             model_config = unwrap_model.config
             generation_config = None
+            
             if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
                 try:
                     # Some model's name_or_path is empty if not initialized from pretrained,

@@ -119,6 +119,7 @@ def load_reward_manager(
     # prime: PrimeRewardManager
     # batch: BatchRewardManager
     # dapo: DAPORewardManager
+    # physics: PhysicsRewardManager
     # Note(haibin.lin): For custom reward managers, please make sure they are imported and
     # registered via `verl.workers.reward_manager.register`
     # By default reward_manager is set to naive (NaiveRewardManager)

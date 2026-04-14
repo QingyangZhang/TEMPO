@@ -96,6 +96,10 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    SELF_CRITIC = "self_critic"
+    EM = "em"
+    EM_TOKEN = "em_token"
+    EM_GAE = "em_gae"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -208,7 +212,7 @@ def get_kl_controller(kl_ctrl):
     else:
         raise NotImplementedError
 
-
+'''
 @register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,
@@ -258,7 +262,419 @@ def compute_gae_advantage_return(
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
+'''
 
+from sklearn.metrics import roc_auc_score
+
+@register_adv_est(AdvantageEstimator.GAE) # or simply: @register_adv_est("gae")
+def compute_gae_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: torch.Tensor,
+    lam: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute Generalized Advantage Estimation (GAE) and Returns, 
+    and additionally calculates AUROC between mean V-preds and binary outcome.
+    
+    Args:
+        token_level_rewards: `(torch.Tensor)` shape (bs, response_length)
+        values: `(torch.Tensor)` shape (bs, response_length)
+        response_mask: `(torch.Tensor)` shape (bs, response_length). [EOS] mask.
+        gamma: `(float)` discounted factor
+        lam: `(float)` lambda value for GAE
+    
+    Returns:
+        advantages: `(torch.Tensor)` shape (bs, response_length)
+        returns: `(torch.Tensor)` shape (bs, response_length)
+        auroc_tensor: `(torch.Tensor)` shape (bs, response_length), filled with the calculated AUROC value
+    """
+    bsz, gen_len = token_level_rewards.shape
+    
+    with torch.no_grad():
+        nextvalues = 0
+        lastgaelam = 0
+        advantages_reversed = []
+
+        # 1. Standard GAE Calculation (Original Logic)
+        for t in reversed(range(gen_len)):
+            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
+            # nextvalues is V(s_{t+1}), which is 0 if t is the end of the response
+            delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+            
+            # GAE: delta_t + gamma * lambda * GAE_{t+1}
+            lastgaelam_ = delta + gamma * lam * lastgaelam
+
+            # Masking logic: skip values and TD-error on padded tokens (where mask is 0)
+            nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
+            lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+
+            advantages_reversed.append(lastgaelam)
+            
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+        returns = advantages + values
+        # Masked whitening of advantages
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+
+        # 2. AUROC Calculation (New Logic)
+        
+        # a. Predicted Scores: Use the average V-pred over the whole response as the score
+        # This aligns with the idea that V-preds should predict the outcome/return.
+        # Ensure we only average over tokens where response_mask is True
+        
+        response_lengths = torch.sum(response_mask, dim=1, keepdim=True)
+        raw_mean = torch.sum(values * response_mask, dim=1, keepdim=True) / (response_lengths + 1e-9)
+        diff_sq = (values - raw_mean) ** 2
+        variance = torch.sum(diff_sq * response_mask, dim=1, keepdim=True) / (response_lengths + 1e-9)
+        std = torch.sqrt(variance)
+        lower_bound = raw_mean - 3 * std
+        upper_bound = raw_mean + 3 * std
+
+        
+        within_3sigma = (values >= lower_bound) & (values <= upper_bound)
+        final_mask = response_mask * within_3sigma.type_as(response_mask)
+        filtered_lengths = torch.sum(final_mask, dim=1)
+        
+        mean_values = torch.sum(values * final_mask, dim=1) / (filtered_lengths + 1e-9)
+
+        predicted_scores = mean_values.detach()
+        
+        # b. Binary Labels: Use the total accumulated reward (Outcome reward)
+        correctness = torch.sum(token_level_rewards, dim=-1)
+        # Threshold assumption: Total reward > 0.5 is "Correct" (1)
+        binary_labels = (correctness > 0.5).long().cpu().numpy()
+        
+        auroc_value = 0.0
+        
+        # Check for sufficient classes to compute AUROC
+        if len(np.unique(binary_labels)) == 2:
+            try:
+                # Need to convert scores to numpy for sklearn
+                auroc_value_np = roc_auc_score(
+                    binary_labels,
+                    predicted_scores.cpu().numpy()
+                )
+                auroc_value = torch.tensor(auroc_value_np, dtype=torch.float32, device=advantages.device)
+            except ValueError as e:
+                # Handle cases where calculation fails (e.g., all prediction scores are the same)
+                print(f"Warning during AUROC calculation in GAE: {e}. Setting AUROC to 0.5.")
+                auroc_value = torch.tensor(0.5, dtype=torch.float32, device=advantages.device)
+        else:
+            # If only one class exists, AUROC is ill-defined (random guess is 0.5)
+            print("Warning: AUROC requires at least two classes (correct/incorrect), setting AUROC to 0.5.")
+            auroc_value = torch.tensor(0.5, dtype=torch.float32, device=advantages.device)
+            
+        # c. Expand AUROC scalar to match advantages/returns shape (bs, response_length)
+        auroc_tensor = auroc_value.unsqueeze(0).unsqueeze(-1).expand_as(advantages)
+
+    return advantages, returns, auroc_tensor
+
+
+
+@register_adv_est(AdvantageEstimator.EM_GAE)
+def compute_em_gae_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: torch.Tensor,
+    lam: torch.Tensor,
+    is_labeled: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    
+    
+    
+    """
+    
+    bsz, seq_len = token_level_rewards.shape
+    # is_labeled: (bsz, 1) -> (bsz, seq_len)
+    is_labeled_bool = is_labeled.view(bsz, 1).bool()
+    # Unlabeled Delta = 0 + gamma * V_{t+1} - V_t
+    effective_rewards = torch.where(
+        is_labeled_bool,
+        token_level_rewards,
+        torch.zeros_like(token_level_rewards)
+    )
+    
+    with torch.no_grad():
+        nextvalues = 0
+        lastgaelam = 0
+        advantages_reversed = []
+        
+        for t in reversed(range(seq_len)):
+            delta = effective_rewards[:, t] + gamma * nextvalues - values[:, t]
+            
+            lastgaelam_ = delta + gamma * lam * lastgaelam
+            
+            nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
+            lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+
+            advantages_reversed.append(lastgaelam)
+        
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+        gae_returns = advantages + values
+        returns = torch.where(is_labeled_bool, gae_returns, values)
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+
+    return advantages, returns
+
+
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+@register_adv_est(AdvantageEstimator.SELF_CRITIC)  # or simply: @register_adv_est("grpo")
+def compute_self_critic_outcome_advantage(
+    vpreds: torch.Tensor,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Compute advantage for GRPO, operating only on Outcome reward
+    (with only one scalar reward for each response), and calculates AUROC
+    between mean_values (scores) and correctness (binary labels).
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        vpreds: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the GRPO advantage
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Note:
+        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
+        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+        
+        The AUROC is computed for:
+        - Predicted scores: `mean_values` (the mean V-pred of the last N tokens).
+        - Binary labels: `correctness` (derived from token_level_rewards sum).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length) (GRPO advantage, unnormalized)
+        returns: `(torch.Tensor)`
+            shape is (bs, response_length) (GRPO advantage, used as returns/target)
+        auroc: `(float)`
+            Area Under the ROC Curve between mean_values and correctness.
+    """
+    
+    N = 128
+    response_lengths = torch.sum(response_mask, dim=1)
+    num_tokens_to_avg = torch.minimum(response_lengths, torch.tensor(N, device=response_lengths.device))
+    
+    # 1. Compute mean_values (scores) - ORIGINAL LOGIC
+    # Create a cumulative sum of the response mask to identify token positions within the response
+    cumsum_mask = torch.cumsum(response_mask, dim=1)
+    # Create a mask that is True only for the last N tokens of each response
+    last_n_mask = (cumsum_mask > (response_lengths - num_tokens_to_avg).unsqueeze(1)) & response_mask.bool()
+    # Apply the mask to the value predictions, setting non-relevant values to 0
+    masked_vpreds = vpreds * last_n_mask
+    # Sum the values of the last N tokens and divide by the actual number of tokens considered (N or less)
+    sum_last_n_vpreds = torch.sum(masked_vpreds, dim=1)
+    mean_values = sum_last_n_vpreds / (num_tokens_to_avg + 1e-9)
+    '''
+    masked_values = vpreds * response_mask
+    response_lengths = torch.sum(response_mask, dim=1)
+    mean_values = torch.sum(masked_values, dim=1) / (response_lengths + 1e-9)
+    '''
+    scores = mean_values
+    
+    # 4. Compute GRPO Advantage - ORIGINAL LOGIC
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0, device=scores.device)
+                id2std[idx] = torch.tensor(1.0, device=scores.device)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor) 
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+        
+        advantages = scores.unsqueeze(-1) * response_mask
+        
+    # tracking AUROC
+    masked_values = vpreds * response_mask
+    response_lengths = torch.sum(response_mask, dim=1)
+    mean_values = torch.sum(masked_values, dim=1) / (response_lengths + 1e-9)
+    predicted_scores = mean_values.detach()
+        
+    # b. Binary Labels: Use the total accumulated reward (Outcome reward)
+    correctness = torch.sum(token_level_rewards, dim=-1)
+    # Threshold assumption: Total reward > 0.5 is "Correct" (1)
+    binary_labels = (correctness > 0.5).long().cpu().numpy()
+        
+    auroc_value = 0.5
+        
+    # Check for sufficient classes to compute AUROC
+    if len(np.unique(binary_labels)) == 2:
+        try:
+            # Need to convert scores to numpy for sklearn
+            auroc_value_np = roc_auc_score(
+                binary_labels,
+                predicted_scores.cpu().numpy()
+            )
+            auroc_value = torch.tensor(auroc_value_np, dtype=torch.float32, device=advantages.device)
+        except ValueError as e:
+            # Handle cases where calculation fails (e.g., all prediction scores are the same)
+            print(f"Warning during AUROC calculation: {e}. Setting AUROC to 0.5.")
+            auroc_value = torch.tensor(0.5, dtype=torch.float32, device=advantages.device)
+    else:
+        # If only one class exists, AUROC is ill-defined (random guess is 0.5)
+        print("Warning: AUROC requires at least two classes (correct/incorrect), setting AUROC to 0.5.")
+        auroc_value = torch.tensor(0.5, dtype=torch.float32, device=advantages.device)
+
+    # c. Expand AUROC scalar to match advantages/returns shape (bs, response_length)
+    auroc_tensor = auroc_value.unsqueeze(0).unsqueeze(-1).expand_as(advantages)
+
+    # 5. Return advantages, returns, and AUROC - MODIFIED RETURN
+    return advantages, advantages, auroc_tensor
+
+
+
+import torch
+import numpy as np
+from collections import defaultdict
+from typing import Optional, Any
+
+@register_adv_est(AdvantageEstimator.EM)
+
+def compute_em_outcome_advantage(
+    vpreds: torch.Tensor,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    is_labeled: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[Any] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    
+    
+    
+    
+    """
+    bsz = vpreds.shape[0]
+    seq_len = vpreds.shape[1]
+    is_labeled_bool = is_labeled.squeeze(-1).bool()  # (bsz,)
+    sum_rewards = torch.sum(token_level_rewards, dim=-1)  # (bsz,)
+    response_lengths = torch.sum(response_mask, dim=1)
+    
+    masked_values = vpreds * response_mask
+    response_lengths = torch.sum(response_mask, dim=1)
+    mean_values = torch.sum(masked_values, dim=1) / (response_lengths + 1e-9)
+    mean_values = torch.clamp(mean_values, min=-1.0, max=1.0)
+    # scores = torch.where(is_labeled_bool, sum_rewards, mean_values)
+    
+    ### Last token value baseline
+    last_token_indices = (response_lengths.long() - 1).clamp(min=0)
+    last_values = torch.gather(vpreds, dim=1, index=last_token_indices.unsqueeze(-1)).squeeze(-1)
+    last_values = torch.clamp(last_values, min=-1.0, max=1.0)
+    scores = torch.where(is_labeled_bool, sum_rewards, last_values)
+    
+    '''
+    ### random reward baseline (ablation)
+    random_scores = torch.rand_like(mean_values)
+    random_scores = random_scores * 2 - 1
+    scores = torch.where(is_labeled_bool, sum_rewards, random_scores)
+    '''
+    # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        
+        for idx, score_list in id2score.items():
+            scores_tensor = torch.stack(score_list)
+            if len(score_list) > 1:
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                id2mean[idx] = scores_tensor[0]
+                id2std[idx] = torch.tensor(1.0, device=scores.device)
+
+        final_scores = torch.zeros_like(scores)
+        for i in range(bsz):
+            idx = index[i]
+            if norm_adv_by_std_in_grpo:
+                final_scores[i] = (scores[i] - id2mean[idx]) / (id2std[idx] + epsilon)
+            else:
+                final_scores[i] = scores[i] - id2mean[idx]
+
+        advantages = final_scores.unsqueeze(-1) * response_mask
+
+    # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    returns_labeled = sum_rewards.unsqueeze(-1).expand_as(vpreds)
+    returns_unlabeled = vpreds
+    
+    returns = torch.where(is_labeled_bool.unsqueeze(-1), returns_labeled, returns_unlabeled)
+    returns = returns * response_mask
+
+    return advantages, returns
+
+@register_adv_est(AdvantageEstimator.EM_TOKEN)
+def compute_em_token_advantage(
+    vpreds: torch.Tensor,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    is_labeled: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[Any] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    
+    
+    """
+    bsz, seq_len = vpreds.shape
+    is_labeled_bool = is_labeled.squeeze(-1).bool() # (bsz,)
+    
+    sum_rewards = torch.sum(token_level_rewards, dim=-1) # (bsz,)
+    
+    response_lengths = torch.sum(response_mask, dim=1)
+    last_token_indices = (response_lengths.long() - 1).clamp(min=0)
+    last_values = torch.gather(vpreds, dim=1, index=last_token_indices.unsqueeze(-1)).squeeze(-1)
+    # last_values = torch.clamp(last_values, min=-1.0, max=1.0)
+    
+    terminal_reward = torch.where(is_labeled_bool, sum_rewards, last_values) # (bsz,)
+    outcomes = terminal_reward.unsqueeze(-1).expand_as(vpreds)
+    raw_advantages = (outcomes - vpreds) * response_mask
+    advantages = verl_F.masked_whiten(raw_advantages, response_mask)
+    returns = outcomes * response_mask
+
+    return advantages, returns
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
@@ -1319,7 +1735,7 @@ def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean
     entropy_loss = agg_loss(loss_mat=token_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     return entropy_loss
 
-
+'''
 def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,
@@ -1360,74 +1776,218 @@ def compute_value_loss(
     vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
     return vf_loss, vf_clipfrac
-
-
-import torch.nn.functional as F
-
-def compute_value_loss_self_critic(
+'''
+'''
+# token-level clip
+def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,
+    values: torch.Tensor,
     response_mask: torch.Tensor,
+    cliprange_value: float,
+    loss_agg_mode: str = "token-mean",
+    is_labeled: torch.Tensor = None,
 ):
     """
-    Compute the binary classification loss and sign agreement
-    using only the LAST valid token in each sequence.
-
-    Args:
-        vpreds (torch.FloatTensor):
-            Predicted logits from the value head, shape (batch_size, response_length).
-        returns (torch.FloatTensor):
-            Ground-truth returns (rewards), shape (batch_size, response_length).
-            Positive values are treated as label 1, non-positive as label 0.
-        response_mask (torch.Tensor):
-            Mask indicating which tokens are valid. The loss is computed only on the
-            last valid token for each sequence. Shape (batch_size, response_length).
-
-    Returns:
-        vf_loss (torch.FloatTensor):
-            A scalar tensor containing the binary cross-entropy loss, aggregated
-            by taking the mean over the batch.
-        sign_agreement_ratio (torch.FloatTensor):
-            The fraction of sequences in the batch where the sign of the predicted logit
-            matches the sign of the return at the last valid token (serves as an accuracy metric).
+    Compute the clipped value-function loss for PPO, supporting sample-level filtering.
     """
-    # Find the index of the last valid token for each sequence.
-    # This part remains unchanged.
-    last_token_indices = torch.sum(response_mask, dim=1).long() - 1
-    last_token_indices = last_token_indices.clamp(min=0)
+    if is_labeled is None:
+        labeled_mask = torch.ones(vpreds.shape[0], dtype=torch.bool, device=vpreds.device)
+    else:
+        labeled_mask = is_labeled.view(-1).bool()
 
-    # Gather the predictions (now interpreted as logits) and returns for the last token.
-    # This part also remains unchanged.
-    last_vpreds = torch.gather(vpreds, 1, last_token_indices.unsqueeze(1)).squeeze(1)
-    last_returns = torch.gather(returns, 1, last_token_indices.unsqueeze(1)).squeeze(1)
+    if not labeled_mask.any():
+        vf_loss = vpreds.sum() * 0.0
+        vf_clipfrac = torch.tensor(0.0, device=vpreds.device, dtype=vpreds.dtype)
+        return vf_loss, vf_clipfrac
 
-    # --- START OF MODIFICATIONS ---
+    vpreds_sub = vpreds[labeled_mask]
+    returns_sub = returns[labeled_mask]
+    values_sub = values[labeled_mask]
+    mask_sub = response_mask[labeled_mask]
 
-    # 1. Convert continuous returns into binary labels.
-    # A positive return is mapped to 1.0, while a non-positive one is mapped to 0.0.
-    binary_labels = (last_returns > 0).float()
+    vpredclipped = verl_F.clip_by_value(vpreds_sub, values_sub - cliprange_value, values_sub + cliprange_value)
+    vf_losses1 = (vpreds_sub - returns_sub) ** 2
+    vf_losses2 = (vpredclipped - returns_sub) ** 2
+    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
     
-    # 2. Calculate the Binary Cross-Entropy loss using the logits.
-    # This single function combines a Sigmoid layer and the BCE loss in a
-    # numerically stable way.
-    vf_loss = F.binary_cross_entropy_with_logits(last_vpreds, binary_labels)
+    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=mask_sub, loss_agg_mode=loss_agg_mode)
+    
+    vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), mask_sub)
 
-    predicted_labels = (last_vpreds > 0.00001).float()
+    return vf_loss, vf_clipfrac
+'''
+
+'''
+def compute_value_loss(
+    vpreds: torch.Tensor,
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    cliprange_value: float,
+    loss_agg_mode: str = "token-mean",
+    is_labeled: torch.Tensor = None,
+):
+    """
+    Compute the clipped value-function loss for PPO, supporting sample-level filtering.
+    Added: Clamping vpreds to [-1.0, 1.0] before loss computation.
+    """
+    if is_labeled is None:
+        labeled_mask = torch.ones(vpreds.shape[0], dtype=torch.bool, device=vpreds.device)
+    else:
+        labeled_mask = is_labeled.view(-1).bool()
+
+    if not labeled_mask.any():
+        vf_loss = vpreds.sum() * 0.0
+        vf_clipfrac = torch.tensor(0.0, device=vpreds.device, dtype=vpreds.dtype)
+        return vf_loss, vf_clipfrac
+
+    vpreds_sub = vpreds[labeled_mask]
+    returns_sub = returns[labeled_mask]
+    values_sub = values[labeled_mask]
+    mask_sub = response_mask[labeled_mask]
     
-    # 2. 获取真实的类别标签 (这和计算 loss 时用的 binary_labels 完全一样)
-    ground_truth_labels = (last_returns > 0.0001).float()
+    vpreds_sub_clamped = torch.clamp(vpreds_sub, min=-1.0, max=1.0)
     
-    # 3. 计算预测标签和真实标签一致的比例，即准确率
-    accuracy = (predicted_labels == ground_truth_labels).float().mean()
+    vpredclipped = verl_F.clip_by_value(vpreds_sub, values_sub - cliprange_value, values_sub + cliprange_value)
     
-    # 返回这个新的、更准确的评估指标
-    # 你可以重命名 sign_agreement_ratio 为 vf_accuracy
-    vf_accuracy = accuracy 
+    vpredclipped_clamped = torch.clamp(vpredclipped, min=-1.0, max=1.0)
+
+    vf_losses1 = (vpreds_sub_clamped - returns_sub) ** 2
+    vf_losses2 = (vpredclipped_clamped - returns_sub) ** 2
+
+    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
     
-    # return vf_loss, sign_agreement_ratio  <- 旧的返回
-    return vf_loss, vf_accuracy  # <- 新的返回
+    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=mask_sub, loss_agg_mode=loss_agg_mode)
+    
+    vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), mask_sub)
+
+    return vf_loss, vf_clipfrac
+
+'''
 
 
+import torch
+import torch.nn.functional as F
+
+def compute_value_loss(
+    vpreds: torch.Tensor,
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    cliprange_value: float = 0.1,
+    loss_agg_mode: str = "token-mean",
+    is_labeled: torch.Tensor = None,
+):
+    """
+    Compute the clipped value-function loss for PPO.
+    Clipping is based on the sequence-level mean difference instead of token-level.
+    """
+    # seq-mean clip value loss
+    
+    if is_labeled is None:
+        labeled_mask = torch.ones(vpreds.shape[0], dtype=torch.bool, device=vpreds.device)
+    else:
+        labeled_mask = is_labeled.view(-1).bool()
+
+    if not labeled_mask.any():
+        vf_loss = vpreds.sum() * 0.0
+        vf_clipfrac = torch.tensor(0.0, device=vpreds.device, dtype=vpreds.dtype)
+        return vf_loss, vf_clipfrac
+
+    vpreds_sub = vpreds[labeled_mask]
+    returns_sub = returns[labeled_mask]
+    values_sub = values[labeled_mask]
+    mask_sub = response_mask[labeled_mask]
+
+    mask_sum = mask_sub.sum(dim=-1, keepdim=True)
+    mask_sum = torch.clamp(mask_sum, min=1e-8)
+    
+    mean_vpreds = (vpreds_sub * mask_sub).sum(dim=-1, keepdim=True) / mask_sum
+    mean_values = (values_sub * mask_sub).sum(dim=-1, keepdim=True) / mask_sum
+
+    mean_delta = mean_vpreds - mean_values
+    clipped_mean_delta = verl_F.clip_by_value(
+        mean_delta, 
+        -torch.full_like(mean_delta, cliprange_value),
+        torch.full_like(mean_delta, cliprange_value)
+    )
+    
+    # vpredclipped = vpreds + (clipped_mean_delta - mean_delta)
+    vpredclipped = vpreds_sub + (clipped_mean_delta - mean_delta)
+
+    vf_losses1 = (vpreds_sub - returns_sub) ** 2
+    vf_losses2 = (vpredclipped - returns_sub) ** 2
+    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+    
+    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=mask_sub, loss_agg_mode=loss_agg_mode)
+    
+    is_clipped = (clipped_mean_delta != mean_delta).float() # (B_sub, 1)
+    vf_clipfrac = verl_F.masked_mean(is_clipped.expand_as(vpreds_sub), mask_sub)
+
+    return vf_loss, vf_clipfrac
+
+
+'''
+def compute_value_loss(
+    vpreds: torch.Tensor,
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    cliprange_value: float = 0.1,
+    loss_agg_mode: str = "token-mean",
+    is_labeled: torch.Tensor = None,
+):
+    """
+    
+    """
+    
+    if is_labeled is None:
+        labeled_mask = torch.ones(vpreds.shape[0], dtype=torch.bool, device=vpreds.device)
+    else:
+        labeled_mask = is_labeled.view(-1).bool()
+
+    if not labeled_mask.any():
+        vf_loss = vpreds.sum() * 0.0
+        vf_clipfrac = torch.tensor(0.0, device=vpreds.device, dtype=vpreds.dtype)
+        return vf_loss, vf_clipfrac
+
+    vpreds_sub = vpreds[labeled_mask]      # (B_sub, L)
+    
+    values_sub = values[labeled_mask]      # (B_sub, L)
+    mask_sub = response_mask[labeled_mask] # (B_sub, L)
+
+    last_indices = (mask_sub.sum(dim=-1).long() - 1).clamp(min=0) # (B_sub,)
+
+    vpreds_last = vpreds_sub.gather(dim=1, index=last_indices.unsqueeze(-1))
+    values_last = values_sub.gather(dim=1, index=last_indices.unsqueeze(-1))
+    
+    if returns_sub.shape[1] > 1:
+        returns_last = returns_sub.gather(dim=1, index=last_indices.unsqueeze(-1))
+    else:
+        returns_last = returns_sub
+
+    v_error = vpreds_last - values_last
+    v_error_clipped = torch.clamp(
+        v_error, 
+        -cliprange_value, 
+        cliprange_value
+    )
+    
+    vpredclipped_last = values_last + v_error_clipped
+
+    vf_losses1 = (vpreds_last - returns_last) ** 2
+    vf_losses2 = (vpredclipped_last - returns_last) ** 2
+    
+    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+    
+    vf_loss = 0.5 * clipped_vf_losses.mean()
+    
+    is_clipped = (v_error_clipped != v_error).float()
+    vf_clipfrac = is_clipped.mean()
+
+    return vf_loss, vf_clipfrac
+'''
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.

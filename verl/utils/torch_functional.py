@@ -202,6 +202,64 @@ def masked_var(values, mask, unbiased=True):
         variance = variance * bessel_correction
     return variance
 
+def masked_seq_var(values, mask, unbiased=True):
+    """
+    Compute variance per response and then average them.
+    
+    Args:
+        values: Tensor of shape (Batch_Size, Sequence_Length)
+        mask: Tensor of shape (Batch_Size, Sequence_Length), 1 for valid, 0 for pad
+        unbiased: Whether to use Bessel's correction (divide by N-1)
+    """
+    num_valid = mask.sum(dim=-1, keepdim=True)
+    
+    safe_num_valid = num_valid.clone()
+    safe_num_valid[safe_num_valid == 0] = 1
+
+    mean = (values * mask).sum(dim=-1, keepdim=True) / safe_num_valid
+    
+    centered_sq = ((values - mean) * mask) ** 2
+    
+    variance = centered_sq.sum(dim=-1, keepdim=True) / safe_num_valid
+    
+    if unbiased:
+        valid_response_mask = (num_valid > 1).float()
+        
+        denom = (num_valid - 1).clamp(min=1e-8)
+        bessel_correction = num_valid / denom
+        
+        variance = variance * bessel_correction * valid_response_mask
+    else:
+        valid_response_mask = (num_valid > 0).float()
+        variance = variance * valid_response_mask
+
+    num_valid_responses = valid_response_mask.sum()
+    
+    if num_valid_responses == 0:
+        return torch.tensor(0.0, device=values.device)
+        
+    final_avg_variance = variance.sum() / num_valid_responses
+    
+    return final_avg_variance
+
+def masked_max_mean(values, mask):
+    """
+    
+    Compute the mean of the maximum values per response with masking.
+    
+    Args:
+        values: Tensor of shape (Batch_Size, Seq_Len)
+        mask: Tensor of shape (Batch_Size, Seq_Len), 1 for valid, 0 for padding
+    """
+    mask_bool = mask.bool()
+    
+    masked_values = values.masked_fill(~mask_bool, float('-inf'))
+    
+    max_values_per_response = masked_values.max(dim=-1).values
+    
+    
+    return max_values_per_response.mean()
+
 
 def masked_whiten(values, mask, shift_mean=True):
     """

@@ -16,6 +16,13 @@ reward_model:
     len: 0
     penalty_factor: 0.0
     log: False
+  # additional args for EMPO
+  reward_kwargs:
+    n_samples_per_prompt: ${actor_rollout_ref.rollout.n}
+    n_votes_per_prompt: ${actor_rollout_ref.rollout.n}
+    mode: "train"
+    reward_type: "gt"
+    entropy_thres: 1.0
 
 algorithm:
   filter_groups:

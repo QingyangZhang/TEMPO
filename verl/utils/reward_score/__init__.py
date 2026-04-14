@@ -40,10 +40,23 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    from . import rm_physics
+
+    res = rm_p1.compute_score_p1(solution_str, ground_truth)
+    
+    if isinstance(res, dict):
+        return res
+    elif isinstance(res, int | float | bool):
+        return float(res)
+    else:
+        return float(res[0])
+    
+    '''
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
+        
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 
@@ -111,6 +124,26 @@ def default_compute_score(
         return float(res)
     else:
         return float(res[0])
+    '''
+
+def empo_compute_score(data_source, 
+                           solution_str, 
+                           ground_truth, 
+                           extra_info:dict={}, 
+                           use_xverify=True):
+
+    from . import empo_verify
+    question = extra_info.get("question", "")
+    # answer_types = extra_info.get("answer_types", [])
+    points = extra_info.get("points", [])
+    res = empo_verify.compute_score(solution_str, ground_truth, question, points, use_xverify=use_xverify)
+    
+    if isinstance(res, dict):
+        return res
+    elif isinstance(res, (int, float, bool)):
+        return float(res)
+    else:
+        return float(res[0])    
 
 
 @deprecated("verl.utils.reward_score.default_compute_score")

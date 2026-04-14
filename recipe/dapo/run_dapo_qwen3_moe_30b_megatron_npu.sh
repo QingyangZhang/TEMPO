@@ -36,11 +36,11 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B"}
+MODEL_PATH=${MODEL_PATH:-"path/to/model"}
 # MCORE_MODEL_PATH points to the converted checkpoint.
 # To avoid loading these weights, set actor_rollout_ref.actor.megatron.use_dist_checkpointing=False.
 MCORE_MODEL_PATH=${MCORE_MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-30B-A3B-dist_ckpt"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
+CKPTS_DIR=${CKPTS_DIR:-"./checkpoints/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 

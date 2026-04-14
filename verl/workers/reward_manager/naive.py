@@ -14,11 +14,13 @@
 
 from collections import defaultdict
 from typing import Any
+from tqdm import tqdm
 
 import torch
 
 from verl import DataProto
-from verl.utils.reward_score import default_compute_score
+# from verl.utils.reward_score import default_compute_score
+from verl.utils.reward_score.rm_physics import compute_score_p1
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
@@ -40,7 +42,7 @@ class NaiveRewardManager(AbstractRewardManager):
         """
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.compute_score = compute_score or default_compute_score
+        self.compute_score = compute_score_p1
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
@@ -87,10 +89,9 @@ class NaiveRewardManager(AbstractRewardManager):
             extra_info["rollout_reward_scores"] = rollout_reward_scores
 
             score = self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
+                model_output=response_str,
+                label=ground_truth,
+                use_xverify=False,
             )
 
             if isinstance(score, dict):

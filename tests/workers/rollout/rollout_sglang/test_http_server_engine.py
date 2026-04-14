@@ -295,7 +295,7 @@ class TestLaunchServerProcess:
 
             with patch(
                 "verl.workers.rollout.sglang_rollout.http_server_engine.time.time",
-                side_effect=itertools.chain([0], itertools.repeat(400)),  # 第一次返回0，之后一直返回400
+                side_effect=itertools.chain([0], itertools.repeat(400)),
             ):
                 with pytest.raises(TimeoutError):
                     launch_server_process(server_args, first_rank_in_node=True)

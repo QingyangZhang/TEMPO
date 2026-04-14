@@ -31,7 +31,7 @@ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, masked_seq_var, masked_max_mean
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from verl.workers.critic import BasePPOCritic
 
@@ -198,7 +198,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         if not self.config.self_critic:
             select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
         else:
-            select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns", "advantages"]
+            select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns", "is_labeled"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -228,25 +228,17 @@ class DataParallelPPOCritic(BasePPOCritic):
                     response_mask = model_inputs["response_mask"]
 
                     vpreds = self._forward_micro_batch(model_inputs)
-                    if not self.config.self_critic:
-                        values = model_inputs["values"]
-                        returns = model_inputs["returns"]
-                        vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                            vpreds=vpreds,
-                            values=values,
-                            returns=returns,
-                            response_mask=response_mask,
-                            cliprange_value=self.config.cliprange_value,
-                            loss_agg_mode=self.config.loss_agg_mode,
-                        )
-                    else:
-                        advantages = model_inputs["advantages"]
-                        vf_loss, clf_acc = core_algos.compute_value_loss_self_critic(
-                            vpreds=vpreds,
-                            returns=advantages,
-                            response_mask=response_mask,
-                        )
-                        vf_clipfrac = torch.tensor(0.0, device=vf_loss.device)
+                    values = model_inputs["values"]
+                    returns = model_inputs["returns"]
+                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
+                        vpreds=vpreds,
+                        values=values,
+                        returns=returns,
+                        is_labeled=model_inputs["is_labeled"] if self.config.self_critic else None,
+                        response_mask=response_mask,
+                        cliprange_value=self.config.cliprange_value,
+                        loss_agg_mode=self.config.loss_agg_mode,
+                    )
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -262,15 +254,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                             "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
                             "critic/vf_clipfrac": vf_clipfrac.detach().item(),
                             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                            "critic/vpred_max": masked_max_mean(vpreds, response_mask).detach().item(),
                         }
                     )
-                    
-                    if self.config.self_critic:
-                        micro_batch_metrics.update(
-                            {
-                                "critic/clf_acc": clf_acc.detach().item(),
-                            }
-                        )
 
                     append_to_dict(metrics, micro_batch_metrics)
 

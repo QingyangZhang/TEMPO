@@ -626,7 +626,7 @@ def patch_valuehead_model(model) -> None:
     model.can_generate = MethodType(can_generate, model)
     model._no_split_modules = getattr(model.pretrained_model, "_no_split_modules", [])
 
-
+'''
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
@@ -663,7 +663,64 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
     patch_valuehead_model(model)
     return model
+'''
+import os
+import torch
+from glob import glob
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
+def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+    try:
+        model = AutoModelForTokenClassification.from_pretrained(
+            pretrained_model_name_or_path=local_path,
+            torch_dtype=torch_dtype,
+            config=model_config,
+            attn_implementation="flash_attention_2",
+            trust_remote_code=trust_remote_code,
+        )
+        return model
+    except (ValueError, BaseException) as e:
+        if not is_trl_available():
+            raise RuntimeError(
+                f"model({local_path}) is not a value head model, please install trl to make it valid"
+            ) from e
+
+    from trl import AutoModelForCausalLMWithValueHead
+
+    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+        module_class = AutoModelForVision2Seq
+    else:
+        module_class = AutoModelForCausalLM
+        
+    ori_model = module_class.from_pretrained(
+        pretrained_model_name_or_path=local_path,
+        torch_dtype=torch_dtype,
+        config=model_config,
+        attn_implementation="flash_attention_2",
+        trust_remote_code=trust_remote_code,
+    )
+
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
+
+    shard_files = glob(os.path.join(local_path, "model-*.safetensors"))
+    
+    if not shard_files:
+        single_file = os.path.join(local_path, "model.safetensors")
+        if os.path.exists(single_file):
+            shard_files = [single_file]
+
+    if shard_files:
+        print(f"Found {len(shard_files)} weight shards. Loading to restore v_head...")
+        for shard in shard_files:
+            state_dict = load_file(shard, device="cpu")
+            model.load_state_dict(state_dict, strict=False)
+        print("Critic weights (v_head) restored successfully.")
+    else:
+        print("Warning: No safetensors found. v_head might remain randomly initialized.")
+
+    # patch_valuehead_model(model) 
+    return model
 
 _architecture_to_auto_class = {
     "ForCausalLM": AutoModelForCausalLM,
